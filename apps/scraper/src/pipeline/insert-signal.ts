@@ -27,7 +27,7 @@ import { correlateSignal } from './correlate'
 import type { CorrelationCandidate } from './correlate'
 import { recordSuccess } from '../health'
 import { computeReliabilityScore, maxSeverityForSourceCount } from './reliability-score'
-import { dedup } from './dedup'
+import { dedup, checkSemanticDuplicate } from './dedup'
 import { processSignalForKnowledgeGraph, extractEntitiesRuleBased, upsertEntityNode } from './entity-graph'
 import { embedSignal } from './embeddings'
 
@@ -35,17 +35,44 @@ import { embedSignal } from './embeddings'
 const FLASH_RELIABILITY_THRESHOLD = 0.65
 const ELEVATED_CATEGORIES = new Set(['breaking', 'conflict', 'disaster'])
 
-function computeAlertTier(severity: string, reliabilityScore: number, category: string): 'FLASH' | 'PRIORITY' | 'ROUTINE' {
+function computeAlertTier(
+  severity: string,
+  reliabilityScore: number,
+  category: string,
+  zScoreBoost: boolean = false,
+): 'FLASH' | 'PRIORITY' | 'ROUTINE' {
+  let tier: 'FLASH' | 'PRIORITY' | 'ROUTINE' = 'ROUTINE'
+
   if (severity === 'critical') {
-    if (reliabilityScore >= FLASH_RELIABILITY_THRESHOLD || category === 'breaking') {
-      return 'FLASH'
-    }
-    return 'PRIORITY'
+    tier = (reliabilityScore >= FLASH_RELIABILITY_THRESHOLD || category === 'breaking')
+      ? 'FLASH' : 'PRIORITY'
+  } else if (severity === 'high' || ELEVATED_CATEGORIES.has(category)) {
+    tier = 'PRIORITY'
   }
-  if (severity === 'high' || ELEVATED_CATEGORIES.has(category)) {
-    return 'PRIORITY'
+
+  // Z-score escalation: if this category is experiencing anomalous volume (≥2σ),
+  // boost the tier by one level — surfaces signals in unusual surges faster
+  if (zScoreBoost && tier !== 'FLASH') {
+    tier = tier === 'ROUTINE' ? 'PRIORITY' : 'FLASH'
   }
-  return 'ROUTINE'
+
+  return tier
+}
+
+/**
+ * Check if the signal's category is currently experiencing anomalous volume
+ * by reading cached z-score from cortex baselines (Redis).
+ */
+async function checkZScoreBoost(category: string): Promise<boolean> {
+  try {
+    const cached = await redis.get(`cortex:baseline:${category}:global:all`)
+    if (!cached) return false
+    const stats = JSON.parse(cached)
+    // Boost if 7-day z-score ≥ 2.0 (anomalous surge)
+    return (stats.z_score_7d ?? 0) >= 2.0
+  } catch {
+    return false
+  }
 }
 
 /** Extra metadata not in the DB row but needed for correlation */
@@ -132,10 +159,13 @@ export async function insertAndCorrelate(
   }
 
   // 1. Compute alert tier before insert (FLASH/PRIORITY/ROUTINE urgency classification)
+  // Check if this category is in an anomalous surge (z-score ≥ 2σ) — boosts tier
+  const zScoreBoost = await checkZScoreBoost(rawCategory)
   const alertTierComputed = computeAlertTier(
     String(signalData.severity ?? 'low'),
     dynamicScore,
     rawCategory,
+    zScoreBoost,
   )
   const signalWithTier = { ...signalData, alert_tier: alertTierComputed }
 
@@ -154,6 +184,20 @@ export async function insertAndCorrelate(
 
   // 2. Run cross-source correlation (non-blocking — errors are non-fatal)
   try {
+    // Fetch embedding if it exists (may have been set by on-insert embedding)
+    let embedding: number[] | null = null
+    try {
+      const embRow = await db.raw(
+        'SELECT embedding::text FROM signals WHERE id = ? AND embedding IS NOT NULL',
+        [signal.id],
+      )
+      if (embRow.rows?.[0]?.embedding) {
+        // pgvector format: "[0.1,0.2,...]" → number[]
+        const raw = embRow.rows[0].embedding as string
+        embedding = JSON.parse(raw.replace(/^\[/, '[').replace(/\]$/, ']'))
+      }
+    } catch { /* non-fatal — correlate without semantic scoring */ }
+
     const candidate: CorrelationCandidate = {
       id:               String(signal.id),
       title:            String(signal.title ?? ''),
@@ -166,6 +210,7 @@ export async function insertAndCorrelate(
       published_at:     signal.event_time ?? signal.created_at ?? new Date(),
       reliability_score: Number(signal.reliability_score ?? 0.5),
       tags:             Array.isArray(signal.tags) ? signal.tags : [],
+      embedding,
     }
 
     const cluster = await correlateSignal(candidate)
@@ -263,10 +308,18 @@ export async function insertAndCorrelate(
 
   // 5. Vector embedding — async, non-blocking
   //    Generates embedding for semantic search & similarity matching.
-  //    Uses OpenAI text-embedding-3-small if OPENAI_API_KEY is set, TF-IDF fallback otherwise.
+  //    After embedding succeeds, run semantic dedup to detect near-identical signals.
   try {
     embedSignal(String(signal.id), String(signal.title ?? ''), String(signal.summary ?? ''))
-      .catch(err => logger.debug({ err, signalId: signal.id }, 'Embedding failed (non-fatal)'))
+      .then(async (embedded) => {
+        if (!embedded) return
+        // 5a. Semantic dedup — flag near-duplicates (cosine > 0.92 within 12h)
+        const originalId = await checkSemanticDuplicate(String(signal.id))
+        if (originalId) {
+          logger.info({ signalId: signal.id, originalId }, 'Signal flagged as semantic duplicate')
+        }
+      })
+      .catch(err => logger.debug({ err, signalId: signal.id }, 'Embedding/dedup failed (non-fatal)'))
   } catch (err) {
     logger.debug({ err, signalId: signal.id }, 'Embedding setup failed (non-fatal)')
   }

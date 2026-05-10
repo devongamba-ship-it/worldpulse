@@ -13,17 +13,22 @@
  *   1.6.4 — Semantic Embeddings (on-insert + backfill)
  *   1.6.5 — Cross-Domain Pattern Detection (weekly, Sunday 5am UTC)
  *   1.6.6 — Cortex Metrics & Health (on-demand)
+ *   1.6.7 — Feed Quality Scoring (nightly, 5am UTC)
  *
  * @module cortex
  */
 
 // Re-export all subsystems
 export { computeDailyBaselines, getBaselineStats, detectAnomalies, runNightlyBaselines, backfillBaselines } from './baselines.js'
-export { runEventThreadsCycle } from './event-threads.js'
-export { runEntityStrengtheningCycle } from './entity-strengthen.js'
+export { runEventThreadsCycle, generateThreadSummaries } from './event-threads.js'
+export { runEntityStrengtheningCycle, inferCausalRelationships } from './entity-strengthen.js'
 export { embedSignal, findSimilarSignals, semanticSearch, checkSemanticDuplicate, backfillEmbeddings, getEmbeddingStats } from './embeddings.js'
-export { runPatternDetectionCycle, learnCausalChains, detectCrossClusterBridges, detectGeographicHotspots } from './pattern-detection.js'
+export { runPatternDetectionCycle, learnCausalChains, detectCrossClusterBridges, detectGeographicHotspots, mineTemporalSequences } from './pattern-detection.js'
+export { generatePatternAlerts } from './pattern-alerts.js'
+export { generateWeeklySynthesis, publishWeeklySynthesis } from './weekly-synthesis.js'
+export { syncClustersToPostgres, getCluster, getRecentClusters, getClusterStats } from './correlation-store.js'
 export { getCortexHealth, computeIntelligenceQuality } from './metrics.js'
+export { computeFeedQuality, getSourceQualityScores, getFeedQualitySummary } from './feed-quality.js'
 
 // ─── Full Cortex Diagnostic ─────────────────────────────────────────────────
 
@@ -36,7 +41,12 @@ export async function runCortexDiagnostic(): Promise<{
   summary: string
 }> {
   const { getCortexHealth } = await import('./metrics.js')
-  const health = await getCortexHealth()
+  const { getFeedQualitySummary } = await import('./feed-quality.js')
+
+  const [health, feedQuality] = await Promise.all([
+    getCortexHealth(),
+    getFeedQualitySummary().catch(() => null),
+  ])
 
   const q = health.intelligence_quality
   const lines = [
@@ -49,6 +59,9 @@ export async function runCortexDiagnostic(): Promise<{
     `Threads: ${q.active_threads} active (${q.signals_in_threads} signals)`,
     `Baselines: ${q.baseline_days} days | Anomalies (7d): ${q.anomalies_last_7d}`,
     `Patterns: ${q.causal_chains_discovered} chains, ${q.geographic_hotspots} hotspots, ${q.cross_cluster_bridges} bridges`,
+    ...(feedQuality ? [
+      `Feed Quality: ${feedQuality.avg_quality}/100 avg across ${feedQuality.total_sources} sources (${feedQuality.sources_above_70} good, ${feedQuality.sources_below_30} poor, ${feedQuality.declining_count} declining)`,
+    ] : []),
     '',
     'Subsystems:',
     ...health.subsystems.map(s => `  ${s.status === 'healthy' ? '✓' : s.status === 'degraded' ? '⚠' : '✗'} ${s.name}: ${s.status}`),

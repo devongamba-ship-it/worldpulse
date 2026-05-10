@@ -800,6 +800,64 @@ async function run() {
   await db.raw(`CREATE INDEX IF NOT EXISTS idx_signal_anomalies_category ON signal_anomalies (category)`)
   await db.raw(`CREATE INDEX IF NOT EXISTS idx_signal_anomalies_z_score ON signal_anomalies (z_score DESC)`)
 
+  // ── Event threads: add columns expected by event-threads.ts ─────────────
+  // These were added to prod DB in prior sessions but never captured in migrations.
+  await db.raw(`ALTER TABLE event_threads ADD COLUMN IF NOT EXISTS peak_severity VARCHAR(10) DEFAULT 'medium'`)
+  await db.raw(`ALTER TABLE event_threads ADD COLUMN IF NOT EXISTS source_count INTEGER DEFAULT 0`)
+  await db.raw(`ALTER TABLE event_threads ADD COLUMN IF NOT EXISTS avg_reliability REAL DEFAULT 0`)
+  await db.raw(`ALTER TABLE event_threads ADD COLUMN IF NOT EXISTS severity_trajectory JSONB DEFAULT '[]'::jsonb`)
+  await db.raw(`ALTER TABLE event_threads ADD COLUMN IF NOT EXISTS related_entities TEXT[] DEFAULT '{}'`)
+  await db.raw(`ALTER TABLE event_threads ADD COLUMN IF NOT EXISTS cluster_id TEXT DEFAULT NULL`)
+  await db.raw(`ALTER TABLE event_threads ADD COLUMN IF NOT EXISTS first_seen TIMESTAMPTZ DEFAULT NOW()`)
+  await db.raw(`ALTER TABLE event_thread_signals ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'member'`)
+
+  // ── Semantic dedup: duplicate_of column on signals ─────────────────────
+  await db.raw(`
+    ALTER TABLE signals ADD COLUMN IF NOT EXISTS duplicate_of TEXT DEFAULT NULL
+  `)
+  await db.raw(`CREATE INDEX IF NOT EXISTS idx_signals_duplicate_of ON signals (duplicate_of) WHERE duplicate_of IS NOT NULL`)
+
+  // ── Feed quality scoring: source_quality table ─────────────────────────
+  await db.raw(`
+    CREATE TABLE IF NOT EXISTS source_quality (
+      source_id          TEXT PRIMARY KEY,
+      source_name        TEXT NOT NULL DEFAULT '',
+      total_signals      INTEGER NOT NULL DEFAULT 0,
+      avg_reliability    REAL NOT NULL DEFAULT 0,
+      corroboration_rate REAL NOT NULL DEFAULT 0,
+      avg_freshness_min  REAL NOT NULL DEFAULT 0,
+      volume_7d          INTEGER NOT NULL DEFAULT 0,
+      volume_30d         INTEGER NOT NULL DEFAULT 0,
+      last_signal_at     TIMESTAMPTZ,
+      quality_score      REAL NOT NULL DEFAULT 0,
+      trend              TEXT NOT NULL DEFAULT 'stable',
+      updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `)
+
+  // ── Event thread summaries column ──────────────────────────────────────
+  await db.raw(`
+    ALTER TABLE event_threads ADD COLUMN IF NOT EXISTS summary_generated_at TIMESTAMPTZ DEFAULT NULL
+  `)
+
+  // ── Correlation clusters table (Redis → PostgreSQL migration) ───────────
+  await db.raw(`
+    CREATE TABLE IF NOT EXISTS correlation_clusters (
+      cluster_id        TEXT PRIMARY KEY,
+      primary_signal_id UUID REFERENCES signals(id) ON DELETE SET NULL,
+      signal_ids        TEXT[] NOT NULL DEFAULT '{}',
+      categories        TEXT[] NOT NULL DEFAULT '{}',
+      sources           TEXT[] NOT NULL DEFAULT '{}',
+      severity          VARCHAR(20) DEFAULT 'medium',
+      correlation_score REAL DEFAULT 0,
+      signal_count      INT DEFAULT 0,
+      created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `)
+  await db.raw(`CREATE INDEX IF NOT EXISTS idx_correlation_clusters_created ON correlation_clusters(created_at DESC)`)
+  await db.raw(`CREATE INDEX IF NOT EXISTS idx_correlation_clusters_score ON correlation_clusters(correlation_score DESC)`)
+
   console.log('✅  Migrations complete.')
 }
 

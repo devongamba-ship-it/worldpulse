@@ -1331,4 +1331,82 @@ export const registerAnalyticsRoutes: FastifyPluginAsync = async (app) => {
       message: `Backfill started for last ${Math.min(days, 90)} days. Check server logs for progress.`,
     })
   })
+
+  // ─── FEED QUALITY ──────────────────────────────────────────
+  // GET /api/v1/analytics/feed-quality
+  // Per-source quality scores — reliability, freshness, corroboration, volume
+  app.get('/feed-quality', {
+    schema: {
+      summary: 'Feed Quality Scores',
+      description: 'Per-source quality metrics showing which feeds contribute the most valuable intelligence',
+    },
+    config: { rateLimit: { max: 30, timeWindow: '1 minute' } },
+  }, async (_req, reply) => {
+    const { getSourceQualityScores, getFeedQualitySummary } = await import('../lib/cortex/feed-quality.js')
+    const [scores, summary] = await Promise.all([
+      getSourceQualityScores(),
+      getFeedQualitySummary(),
+    ])
+    return reply.send({ success: true, summary, sources: scores })
+  })
+
+  // POST /api/v1/analytics/feed-quality/compute
+  // Trigger an on-demand feed quality computation. Admin-only.
+  app.post('/feed-quality/compute', {
+    preHandler: [authenticate],
+    schema: {
+      summary: 'Compute Feed Quality',
+      description: 'Run feed quality scoring on-demand (admin use)',
+    },
+  }, async (_req, reply) => {
+    const { computeFeedQuality } = await import('../lib/cortex/feed-quality.js')
+    // Run async — don't block the response
+    computeFeedQuality().catch(err => {
+      console.error('[CORTEX] Feed quality computation failed:', err)
+    })
+    return reply.send({
+      success: true,
+      message: 'Feed quality computation started. Check server logs for progress.',
+    })
+  })
+
+  // GET /api/v1/analytics/weekly-synthesis
+  // Returns the latest weekly intelligence synthesis
+  app.get('/weekly-synthesis', {
+    schema: {
+      summary: 'Weekly Intelligence Synthesis',
+      description: 'Latest weekly digest combining threads, anomalies, entities, and patterns',
+    },
+  }, async (_req, reply) => {
+    const cached = await redis.get('cortex:weekly-synthesis:latest').catch(() => null)
+    if (cached) {
+      return reply.header('X-Cache-Hit', 'true').send({
+        success: true,
+        synthesis: JSON.parse(cached),
+      })
+    }
+
+    // Generate on-demand if not cached
+    const { generateWeeklySynthesis } = await import('../lib/cortex/weekly-synthesis.js')
+    const synthesis = await generateWeeklySynthesis()
+    return reply.send({ success: true, synthesis })
+  })
+
+  // POST /api/v1/analytics/weekly-synthesis/publish (admin only)
+  app.post('/weekly-synthesis/publish', {
+    preHandler: [authenticate],
+    schema: {
+      summary: 'Publish Weekly Synthesis',
+      description: 'Manually trigger weekly synthesis generation and PULSE publication',
+    },
+  }, async (_req, reply) => {
+    const { publishWeeklySynthesis } = await import('../lib/cortex/weekly-synthesis.js')
+    publishWeeklySynthesis().catch(err => {
+      console.error('[CORTEX] Manual weekly synthesis failed:', err)
+    })
+    return reply.send({
+      success: true,
+      message: 'Weekly synthesis publication started. Check server logs for progress.',
+    })
+  })
 }

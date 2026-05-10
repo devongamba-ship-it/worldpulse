@@ -6,6 +6,7 @@ import { RightSidebar } from '@/components/sidebar/RightSidebar'
 import { FeedList } from '@/components/feed/FeedList'
 import { Composer } from '@/components/composer/Composer'
 import { NewPostsBar } from '@/components/feed/NewPostsBar'
+import { DevelopingStories } from '@/components/feed/DevelopingStories'
 import { OnboardingModal } from '@/components/OnboardingModal'
 
 type FeedTab    = 'global' | 'following' | 'verified' | 'digest' | 'for_you'
@@ -103,6 +104,9 @@ export default function HomePage() {
             ))}
           </div>
         </div>
+
+        {/* Developing Stories — escalating/developing event threads */}
+        <DevelopingStories />
 
         {/* Composer */}
         <Composer />

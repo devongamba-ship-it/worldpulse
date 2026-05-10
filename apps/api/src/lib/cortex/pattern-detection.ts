@@ -271,6 +271,131 @@ export async function detectGeographicHotspots(
   return hotspots
 }
 
+// ─── Temporal Sequence Mining ────────────────────────────────────────────────
+
+/**
+ * Discover recurring event sequences from signal category chains within
+ * event threads. For example: sanctions → dark_vessel_spike → chokepoint_alert.
+ *
+ * Looks at the order categories appear within threads, then finds sequences
+ * that repeat across multiple threads.
+ */
+export async function mineTemporalSequences(
+  days: number = 60,
+): Promise<TemporalSequence[]> {
+  console.log('[CORTEX] Mining temporal sequences...')
+
+  const cutoff = new Date(Date.now() - days * 24 * 3600 * 1000).toISOString()
+
+  // Get category sequences per thread (ordered by published_at)
+  const threadSequences = await db.raw(`
+    SELECT
+      et.id as thread_id,
+      array_agg(DISTINCT s.category ORDER BY s.published_at) as category_sequence,
+      array_agg(s.published_at ORDER BY s.published_at) as timestamps
+    FROM event_threads et
+    JOIN event_thread_signals ets ON et.id = ets.thread_id
+    JOIN signals s ON ets.signal_id = s.id
+    WHERE et.created_at >= ?
+      AND et.signal_count >= 3
+    GROUP BY et.id
+    HAVING COUNT(DISTINCT s.category) >= 2
+    ORDER BY et.created_at DESC
+    LIMIT 200
+  `, [cutoff])
+
+  const rows = threadSequences.rows ?? []
+  if (rows.length < 3) {
+    console.log('[CORTEX] Not enough multi-category threads for sequence mining')
+    return []
+  }
+
+  // Extract 2-gram and 3-gram category sequences and count occurrences
+  const sequenceCounts = new Map<string, {
+    count: number
+    intervals: number[]
+    last_seen: string
+  }>()
+
+  for (const row of rows as any[]) {
+    const cats: string[] = row.category_sequence ?? []
+    const timestamps: string[] = row.timestamps ?? []
+
+    // 2-grams
+    for (let i = 0; i < cats.length - 1; i++) {
+      const key = `${cats[i]}→${cats[i + 1]}`
+      if (!sequenceCounts.has(key)) {
+        sequenceCounts.set(key, { count: 0, intervals: [], last_seen: '' })
+      }
+      const entry = sequenceCounts.get(key)!
+      entry.count++
+
+      // Compute interval between the two categories
+      if (timestamps[i] && timestamps[i + 1]) {
+        const delta = (new Date(timestamps[i + 1]).getTime() - new Date(timestamps[i]).getTime()) / 3600000
+        if (delta > 0 && delta < 720) entry.intervals.push(delta) // Cap at 30 days
+      }
+
+      if (!entry.last_seen || timestamps[i + 1] > entry.last_seen) {
+        entry.last_seen = timestamps[i + 1]
+      }
+    }
+
+    // 3-grams
+    for (let i = 0; i < cats.length - 2; i++) {
+      const key = `${cats[i]}→${cats[i + 1]}→${cats[i + 2]}`
+      if (!sequenceCounts.has(key)) {
+        sequenceCounts.set(key, { count: 0, intervals: [], last_seen: '' })
+      }
+      const entry = sequenceCounts.get(key)!
+      entry.count++
+      if (timestamps[i + 2] && (!entry.last_seen || timestamps[i + 2] > entry.last_seen)) {
+        entry.last_seen = timestamps[i + 2]
+      }
+    }
+  }
+
+  // Filter to sequences occurring 3+ times
+  const sequences: TemporalSequence[] = []
+
+  for (const [key, data] of sequenceCounts) {
+    if (data.count < 3) continue
+
+    const parts = key.split('→')
+    const avgInterval = data.intervals.length > 0
+      ? data.intervals.reduce((a, b) => a + b, 0) / data.intervals.length
+      : 0
+
+    // Predictive value: how consistent is the interval? (lower variance = more predictive)
+    let predictiveValue = 0
+    if (data.intervals.length >= 3) {
+      const mean = avgInterval
+      const variance = data.intervals.reduce((sum, v) => sum + (v - mean) ** 2, 0) / data.intervals.length
+      const cv = mean > 0 ? Math.sqrt(variance) / mean : 1 // coefficient of variation
+      predictiveValue = Math.max(0, Math.min(1, 1 - cv)) // Lower CV = more predictive
+    }
+
+    sequences.push({
+      sequence: parts,
+      occurrences: data.count,
+      avg_interval_hours: Math.round(avgInterval * 10) / 10,
+      last_seen: data.last_seen,
+      predictive_value: Math.round(predictiveValue * 100) / 100,
+    })
+  }
+
+  // Sort by occurrences desc, then predictive value
+  sequences.sort((a, b) => b.occurrences - a.occurrences || b.predictive_value - a.predictive_value)
+
+  const top = sequences.slice(0, 20)
+  console.log(`[CORTEX] Temporal sequences: ${sequences.length} total, top ${top.length} kept`)
+  for (const s of top.slice(0, 5)) {
+    console.log(`  ${s.sequence.join(' → ')}: ${s.occurrences}x (avg ${s.avg_interval_hours}h, predictive ${s.predictive_value})`)
+  }
+
+  return top
+}
+
 // ─── Full Pattern Detection Cycle ────────────────────────────────────────────
 
 /**
@@ -281,12 +406,14 @@ export async function runPatternDetectionCycle(): Promise<{
   causal_chains: number
   bridges: number
   hotspots: number
+  temporal_sequences: number
 }> {
   console.log('[CORTEX] Running weekly pattern detection...')
 
   const chains = await learnCausalChains(30)
   const bridges = await detectCrossClusterBridges()
   const hotspots = await detectGeographicHotspots(7)
+  const sequences = await mineTemporalSequences(60)
 
   // Cache results for API access
   const report = {
@@ -294,15 +421,17 @@ export async function runPatternDetectionCycle(): Promise<{
     causal_chains: chains,
     cross_cluster_bridges: bridges,
     geographic_hotspots: hotspots,
+    temporal_sequences: sequences,
   }
 
   await redis.setex('cortex:patterns:latest', 7 * 24 * 3600, JSON.stringify(report)).catch(() => {})
 
-  console.log(`[CORTEX] Pattern detection complete: ${chains.length} chains, ${bridges.length} bridges, ${hotspots.length} hotspots`)
+  console.log(`[CORTEX] Pattern detection complete: ${chains.length} chains, ${bridges.length} bridges, ${hotspots.length} hotspots, ${sequences.length} sequences`)
 
   return {
     causal_chains: chains.length,
     bridges: bridges.length,
     hotspots: hotspots.length,
+    temporal_sequences: sequences.length,
   }
 }

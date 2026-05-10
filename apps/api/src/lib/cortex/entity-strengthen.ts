@@ -599,6 +599,118 @@ export async function autoMergeDuplicates(): Promise<{ merged: number; skipped: 
   return { merged, skipped }
 }
 
+// ─── Causal Chain Relationship Inference ────────────────────────────────────
+
+/**
+ * When causal chains link signals that share entities, create inferred edges
+ * between those entities with predicate 'causal_inference'.
+ *
+ * E.g., if "sanctions on Country X" → "commodity price spike" and both signals
+ * mention entities A and B respectively, infer A → B with 'causal_inference'.
+ */
+export async function inferCausalRelationships(): Promise<{ edges_created: number }> {
+  console.log('[CORTEX] Inferring entity relationships from causal chains...')
+
+  // Find entity pairs linked by causal chain signals (different entities in
+  // causally-connected signals within the same event thread)
+  const results = await db.raw(`
+    WITH thread_signal_entities AS (
+      SELECT
+        ets.thread_id,
+        ets.signal_id,
+        s.category,
+        s.published_at,
+        en.id as entity_id,
+        en.canonical_name as entity_name,
+        en.type as entity_type
+      FROM event_thread_signals ets
+      JOIN signals s ON ets.signal_id = s.id
+      JOIN entity_nodes en ON ets.signal_id::text = ANY(
+        CASE
+          WHEN jsonb_typeof(to_jsonb(en.signal_ids)) = 'array'
+          THEN ARRAY(SELECT jsonb_array_elements_text(to_jsonb(en.signal_ids)))
+          ELSE ARRAY[en.signal_ids::text]
+        END
+      )
+      WHERE s.published_at >= NOW() - INTERVAL '30 days'
+    )
+    SELECT
+      e1.entity_id as source_id,
+      e1.entity_name as source_name,
+      e2.entity_id as target_id,
+      e2.entity_name as target_name,
+      e1.category as source_category,
+      e2.category as target_category,
+      COUNT(DISTINCT e1.thread_id) as thread_count
+    FROM thread_signal_entities e1
+    JOIN thread_signal_entities e2
+      ON e1.thread_id = e2.thread_id
+      AND e1.entity_id != e2.entity_id
+      AND e1.category != e2.category
+      AND e1.published_at < e2.published_at
+    GROUP BY e1.entity_id, e1.entity_name, e2.entity_id, e2.entity_name,
+             e1.category, e2.category
+    HAVING COUNT(DISTINCT e1.thread_id) >= 2
+    ORDER BY COUNT(DISTINCT e1.thread_id) DESC
+    LIMIT 50
+  `)
+
+  let edgesCreated = 0
+
+  for (const row of (results.rows ?? []) as any[]) {
+    const confidence = Math.min(0.85, 0.2 * Number(row.thread_count))
+
+    const edgeId = createHash('sha256')
+      .update(`${row.source_id}::${row.target_id}::causal_inference`)
+      .digest('hex')
+      .slice(0, 32)
+
+    const existing = await db('entity_edges')
+      .where('id', edgeId)
+      .first()
+
+    if (existing) {
+      // Update weight if higher
+      if (confidence > Number(existing.weight)) {
+        await db('entity_edges').where('id', edgeId).update({
+          weight: confidence,
+          last_seen: new Date().toISOString(),
+          metadata: JSON.stringify({
+            source_category: row.source_category,
+            target_category: row.target_category,
+            thread_count: Number(row.thread_count),
+          }),
+        })
+      }
+      continue
+    }
+
+    await db('entity_edges')
+      .insert({
+        id: edgeId,
+        source_entity_id: row.source_id,
+        target_entity_id: row.target_id,
+        predicate: 'causal_inference',
+        weight: confidence,
+        signal_ids: '[]',
+        first_seen: new Date().toISOString(),
+        last_seen: new Date().toISOString(),
+        metadata: JSON.stringify({
+          source_category: row.source_category,
+          target_category: row.target_category,
+          thread_count: Number(row.thread_count),
+        }),
+      })
+      .onConflict('id')
+      .ignore()
+
+    edgesCreated++
+  }
+
+  console.log(`[CORTEX] Causal inference: created ${edgesCreated} edges`)
+  return { edges_created: edgesCreated }
+}
+
 // ─── Full cycle ──────────────────────────────────────────────────────────────
 
 /**
@@ -618,6 +730,7 @@ export async function runEntityStrengtheningCycle(): Promise<{
   console.log('[CORTEX] Running entity strengthening cycle...')
 
   const coOccurrence = await inferCoOccurrenceEdges()
+  const causal = await inferCausalRelationships()
   const trends = await updateEntityTrends()
   const merges = await autoMergeDuplicates()
   const importance = await computeImportanceScores()
@@ -625,7 +738,8 @@ export async function runEntityStrengtheningCycle(): Promise<{
   console.log('[CORTEX] Entity strengthening complete')
 
   return {
-    edges_created: coOccurrence.edges_created,
+    edges_created: coOccurrence.edges_created + causal.edges_created,
+    causal_edges_created: causal.edges_created,
     trends_updated: trends.updated,
     entities_merged: merges.merged,
     merge_candidates_skipped: merges.skipped,

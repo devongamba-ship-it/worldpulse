@@ -333,12 +333,250 @@ function detectThreadStatus(
   return 'developing'
 }
 
+// ─── Thread summary generation ──────────────────────────────────────────────
+
+/**
+ * Generate LLM summaries for active threads that need one.
+ *
+ * Criteria for summarization:
+ *   - Thread has ≥3 signals
+ *   - Thread has no summary OR hasn't been summarized since last signal update
+ *   - Thread status is developing or escalating (don't waste LLM on resolved)
+ *
+ * Uses Anthropic Claude (fast) or OpenAI as fallback for generating concise
+ * 2-3 sentence summaries of developing stories.
+ */
+export async function generateThreadSummaries(): Promise<{ summarized: number }> {
+  // Find threads needing summaries
+  const threads = await db('event_threads')
+    .whereIn('status', ['developing', 'escalating'])
+    .where('signal_count', '>=', 3)
+    .where(function () {
+      this.whereNull('summary')
+        .orWhereNull('summary_generated_at')
+        .orWhereRaw('summary_generated_at < last_updated')
+    })
+    .select('id', 'title', 'category', 'region', 'status', 'signal_count', 'peak_severity')
+    .limit(10) // Cap per cycle to control LLM costs
+
+  if (threads.length === 0) return { summarized: 0 }
+
+  let summarized = 0
+
+  for (const thread of threads as any[]) {
+    try {
+      // Get the thread's constituent signals
+      const signals = await db('event_thread_signals')
+        .where('thread_id', thread.id)
+        .join('signals', 'event_thread_signals.signal_id', 'signals.id')
+        .select('signals.title', 'signals.summary as signal_summary', 'signals.category',
+                'signals.severity', 'signals.location_name', 'signals.published_at')
+        .orderBy('signals.published_at', 'desc')
+        .limit(15) // Most recent 15 signals
+
+      if (signals.length < 3) continue
+
+      // Build the signal digest for the LLM
+      const signalDigest = signals.map((s: any, i: number) =>
+        `${i + 1}. [${s.severity}] ${s.title}${s.location_name ? ` (${s.location_name})` : ''}`
+      ).join('\n')
+
+      const prompt = `You are a concise intelligence analyst. Summarize this developing story in 2-3 sentences.
+
+Thread: "${thread.title}"
+Category: ${thread.category} | Region: ${thread.region || 'Global'} | Status: ${thread.status}
+Peak severity: ${thread.peak_severity} | Signal count: ${thread.signal_count}
+
+Recent signals:
+${signalDigest}
+
+Write a factual, neutral summary that captures:
+1. What is happening (the core event)
+2. Scale/scope (where, how many affected)
+3. Trajectory (escalating, stabilizing, or resolving)
+
+Keep it under 100 words. No bullet points. No speculation.`
+
+      const summary = await callLLMForSummary(prompt)
+      if (!summary) continue
+
+      await db('event_threads')
+        .where('id', thread.id)
+        .update({
+          summary,
+          summary_generated_at: new Date().toISOString(),
+        })
+
+      summarized++
+      console.log(`[CORTEX] Thread summary generated: ${thread.title.slice(0, 60)}`)
+    } catch (err) {
+      console.error(`[CORTEX] Thread summary failed for ${thread.id}:`, err)
+    }
+  }
+
+  return { summarized }
+}
+
+/**
+ * Call LLM to generate a thread summary.
+ * Tries Anthropic Claude first (via API), falls back to OpenAI.
+ */
+async function callLLMForSummary(prompt: string): Promise<string | null> {
+  // Try Anthropic first
+  const anthropicKey = process.env.ANTHROPIC_API_KEY
+  if (anthropicKey) {
+    try {
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'x-api-key': anthropicKey,
+          'anthropic-version': '2023-06-01',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 200,
+          messages: [{ role: 'user', content: prompt }],
+        }),
+      })
+
+      if (response.ok) {
+        const data = await response.json() as any
+        const text = data.content?.[0]?.text
+        if (text) return text.trim()
+      }
+    } catch (err) {
+      console.warn('[CORTEX] Anthropic summary failed, trying OpenAI:', err)
+    }
+  }
+
+  // Fallback to OpenAI
+  const openaiKey = process.env.OPENAI_API_KEY
+  if (openaiKey) {
+    try {
+      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${openaiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o-mini',
+          max_tokens: 200,
+          messages: [{ role: 'user', content: prompt }],
+        }),
+      })
+
+      if (response.ok) {
+        const data = await response.json() as any
+        const text = data.choices?.[0]?.message?.content
+        if (text) return text.trim()
+      }
+    } catch (err) {
+      console.warn('[CORTEX] OpenAI summary also failed:', err)
+    }
+  }
+
+  return null
+}
+
+// ─── Chokepoint-to-thread linking ────────────────────────────────────────────
+
+const CHOKEPOINTS = [
+  { id: 'suez',          name: 'Suez Canal',              lat: 30.46, lng: 32.34 },
+  { id: 'panama',        name: 'Panama Canal',            lat:  9.08, lng: -79.68 },
+  { id: 'hormuz',        name: 'Strait of Hormuz',        lat: 26.57, lng: 56.25 },
+  { id: 'malacca',       name: 'Strait of Malacca',       lat:  2.50, lng: 101.50 },
+  { id: 'bab-el-mandeb', name: 'Bab el-Mandeb',           lat: 12.58, lng: 43.32 },
+  { id: 'taiwan',        name: 'Taiwan Strait',            lat: 24.50, lng: 119.50 },
+  { id: 'gibraltar',     name: 'Strait of Gibraltar',      lat: 35.97, lng: -5.60 },
+  { id: 'bosporus',      name: 'Turkish Straits',          lat: 41.12, lng: 29.05 },
+  { id: 'good-hope',     name: 'Cape of Good Hope',        lat: -34.36, lng: 18.47 },
+  { id: 'dover',         name: 'Strait of Dover',          lat: 51.02, lng:  1.45 },
+]
+
+const CHOKEPOINT_RADIUS_KM = 200
+
+/**
+ * Link active event threads to chokepoints by checking if any of their
+ * signals have location data near a chokepoint.
+ * Stores chokepoint metadata in the thread's related_entities field.
+ */
+export async function linkChokepointsToThreads(): Promise<{ linked: number }> {
+  // Get active threads without chokepoint tags
+  const threads = await db('event_threads')
+    .whereIn('status', ['developing', 'escalating'])
+    .select('id')
+
+  let linked = 0
+
+  for (const thread of threads) {
+    // Get signals in this thread that have location data
+    const signals = await db('event_thread_signals as ets')
+      .join('signals as s', 'ets.signal_id', 's.id')
+      .where('ets.thread_id', thread.id)
+      .whereNotNull('s.location')
+      .select(db.raw('ST_Y(s.location::geometry) as lat'), db.raw('ST_X(s.location::geometry) as lng'))
+
+    if (signals.length === 0) continue
+
+    // Check each signal against each chokepoint
+    const matchedChokepoints = new Set<string>()
+
+    for (const signal of signals as any[]) {
+      for (const cp of CHOKEPOINTS) {
+        const distance = haversineKm(signal.lat, signal.lng, cp.lat, cp.lng)
+        if (distance <= CHOKEPOINT_RADIUS_KM) {
+          matchedChokepoints.add(cp.name)
+        }
+      }
+    }
+
+    if (matchedChokepoints.size > 0) {
+      // Read existing related_entities and merge
+      const threadRow = await db('event_threads').where('id', thread.id).first()
+      const existing: string[] = typeof threadRow?.related_entities === 'string'
+        ? JSON.parse(threadRow.related_entities)
+        : threadRow?.related_entities ?? []
+
+      const merged = [...new Set([...existing, ...matchedChokepoints])]
+
+      await db('event_threads')
+        .where('id', thread.id)
+        .update({
+          related_entities: JSON.stringify(merged),
+        })
+
+      linked++
+    }
+  }
+
+  if (linked > 0) {
+    console.log(`[CORTEX] Linked ${linked} threads to chokepoints`)
+  }
+  return { linked }
+}
+
+/**
+ * Haversine distance in km between two lat/lng points
+ */
+function haversineKm(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const R = 6371
+  const dLat = (lat2 - lat1) * Math.PI / 180
+  const dLng = (lng2 - lng1) * Math.PI / 180
+  const a = Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+    Math.sin(dLng / 2) ** 2
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+}
+
 // ─── Full cycle ──────────────────────────────────────────────────────────────
 
 /**
  * Run the full event threads cycle:
  * 1. Promote qualifying Redis clusters to threads
  * 2. Update thread lifecycles (stable/resolved transitions)
+ * 3. Generate LLM summaries for threads needing them
  */
 export async function runEventThreadsCycle(): Promise<{
   promoted: number
@@ -346,9 +584,12 @@ export async function runEventThreadsCycle(): Promise<{
   merged: number
   stabilized: number
   resolved: number
+  summarized: number
 }> {
   const promotion = await promoteClusterToThreads()
   const lifecycle = await updateThreadLifecycles()
+  const summaries = await generateThreadSummaries()
+  const chokepoints = await linkChokepointsToThreads().catch(() => ({ linked: 0 }))
 
-  return { ...promotion, ...lifecycle }
+  return { ...promotion, ...lifecycle, ...summaries, chokepoints_linked: chokepoints.linked }
 }
