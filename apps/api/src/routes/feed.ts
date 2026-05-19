@@ -62,8 +62,6 @@ export const registerFeedRoutes: FastifyPluginAsync = async (app) => {
         's.location_name as signal_location', 's.country_code as signal_country',
         's.tags as signal_tags',
       ])
-      // Exclude posts with empty/stub content (LLM generation failures)
-      .whereRaw("length(regexp_replace(p.content, '\\[.*?\\]|—\\s*PULSE[^\\n]*|\\s', '', 'g')) > 30")
       .limit(pageLimit + 1)
       .orderBy('p.created_at', 'desc')
 

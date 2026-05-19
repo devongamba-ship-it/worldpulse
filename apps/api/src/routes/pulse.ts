@@ -162,7 +162,8 @@ export const registerPulseRoutes: FastifyPluginAsync = async (app) => {
           })
       })
       // Exclude posts with empty/stub content (LLM generation failures)
-      .whereRaw("length(regexp_replace(p.content, '\\[.*?\\]|—\\s*PULSE[^\\n]*|\\s', '', 'g')) > 30")
+      // Empty PULSE posts are ~60 chars of boilerplate: "[FACT CHECK]\n\n\n\n— PULSE ... AI"
+      .whereRaw("length(p.content) > 120")
       .orderBy('p.created_at', 'desc')
       .limit(overFetchLimit)
       .select([
