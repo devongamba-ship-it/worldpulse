@@ -194,8 +194,22 @@ Do NOT include recommendations or developer notes — only report verdicts and q
 
   const result = await generateContent(prompt, 1000, 'deep', EDITORIAL_SYSTEM_PROMPT + '\n\n' + agent.specialization)
 
+  // ── Quality gate: reject empty/short LLM output ───────────────────────
+  const factCheckText = result.text.trim()
+  if (!factCheckText || factCheckText.length < 50) {
+    console.warn(`[PULSE:FactCheck] Rejected: LLM returned empty/short output (${factCheckText.length} chars)`)
+    return {
+      agentId: agent.id,
+      agentName: agent.name,
+      signalsReviewed: suspiciousSignals.length,
+      trendsIdentified: unchecked.length,
+      published: false,
+      error: 'LLM output too short — skipping fact-check publication',
+    }
+  }
+
   // ── Step 5: Apply verdicts — downgrade LIKELY FALSE signals ─────────────
-  const downgraded = await applyVerdicts(result.text, unchecked)
+  const downgraded = await applyVerdicts(factCheckText, unchecked)
 
   // ── Step 6: Publish as a fact-check post ────────────────────────────────
   try {
@@ -203,7 +217,7 @@ Do NOT include recommendations or developer notes — only report verdicts and q
       .insert({
         author_id:          PULSE_USER_ID,
         post_type:          'signal',
-        content:            `[FACT CHECK]\n\n${result.text}\n\n— PULSE Fact-Check Bureau · WorldPulse AI`,
+        content:            `[FACT CHECK]\n\n${factCheckText}\n\n— PULSE Fact-Check Bureau · WorldPulse AI`,
         pulse_content_type: ContentType.ANALYSIS,
         tags:               ['pulse', 'fact-check', 'verification'],
         language:           'en',

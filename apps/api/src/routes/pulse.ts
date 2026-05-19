@@ -161,6 +161,8 @@ export const registerPulseRoutes: FastifyPluginAsync = async (app) => {
               })
           })
       })
+      // Exclude posts with empty/stub content (LLM generation failures)
+      .whereRaw("length(regexp_replace(p.content, '\\[.*?\\]|—\\s*PULSE[^\\n]*|\\s', '', 'g')) > 30")
       .orderBy('p.created_at', 'desc')
       .limit(overFetchLimit)
       .select([

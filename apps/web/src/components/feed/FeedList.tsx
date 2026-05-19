@@ -732,7 +732,7 @@ export function FeedList({ tab, category }: { tab: string; category: string }) {
                   )}
                 </div>
                 <div className="font-semibold text-[14px] text-wp-text mb-1 leading-[1.4]">{item.event.title}</div>
-                {item.event.summary && (
+                {item.event.summary && item.event.summary.trim().toLowerCase() !== item.event.title.trim().toLowerCase() && (
                   <div className="text-[12px] text-wp-text2 leading-[1.5] mb-2">{item.event.summary}</div>
                 )}
                 {/* Source badges + source count */}
